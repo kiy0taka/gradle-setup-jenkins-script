@@ -1,0 +1,131 @@
+import groovy.json.JsonSlurper
+import groovy.text.SimpleTemplateEngine
+
+allprojects {
+    task('setup-jenkins-script') << {
+
+        def model = [:]
+
+        model.jenkinsUrl = System.console().readLine('\n> Jenkins URL: ') ?: 'http://localhost:8080'
+
+        model.jenkinsVersion = {
+            def conn
+            try {
+                conn = new URL(model.jenkinsUrl).openConnection()
+                return conn.getHeaderField('X-Jenkins')
+            } finally {
+                conn?.disconnect()
+            }
+        }()
+
+        def updateCenter = {
+            def payload = new URL('http://updates.jenkins-ci.org/update-center.json').text
+            new JsonSlurper().parseText(payload[(payload.indexOf('(')+1)..payload.lastIndexOf(')')])
+        }()
+
+        model.pluginDependencies = {
+            def payload = new URL("${model.jenkinsUrl}/pluginManager/api/json?tree=plugins[url,shortName,version,dependencies[url,shortName,version]]").text
+            def json = new JsonSlurper().parseText(payload)
+            json.plugins.inject([:]) { map, val ->
+                def plugin = updateCenter.plugins[val.shortName]
+                if (plugin) {
+                    map[val.shortName] = "${plugin.gav}@jar"
+                }
+                map
+            }
+        }()
+
+        def buildTemplate = '''\
+            |import hudson.cli.CLI
+            |
+            |buildscript {
+            |    repositories {
+            |        maven {
+            |            url 'http://repo.jenkins-ci.org/public'
+            |        }
+            |        mavenCentral()
+            |    }
+            |    dependencies {
+            |        classpath "org.jenkins-ci.main:cli:\\${jenkinsVersion}"
+            |    }
+            |}
+            |
+            |apply plugin: 'groovy'
+            |apply plugin: 'idea'
+            |apply plugin: 'eclipse'
+            |
+            |repositories {
+            |    maven {
+            |        url 'http://repo.jenkins-ci.org/public'
+            |    }
+            |    mavenCentral()
+            |}
+            |
+            |sourceSets {
+            |    main {
+            |        groovy {
+            |            srcDirs = ['src/script', 'src/postbuild']
+            |        }
+            |    }
+            |}
+            |
+            |dependencies {
+            |    compile "org.jenkins-ci.main:jenkins-war:\\${jenkinsVersion}:war-for-test"
+            |<% pluginDependencies.each { %>
+            |    compile "${it.value}"<% } %>
+            |}
+            |
+            |def cli = { script ->
+            |    def c = new CLI(new URL(jenkinsUrl))
+            |    try {
+            |        c.execute(['groovy', script.absolutePath], System.in, System.out, System.out)
+            |    } finally {
+            |        c?.close()
+            |    }
+            |}
+            |
+            |def scriptFiles = file('src/script').listFiles(({ it.file && it.name.endsWith('.groovy') } as FileFilter))
+            |
+            |task run << {
+            |    if (scriptFiles) {
+            |        println 'Choose script:'
+            |        scriptFiles.eachWithIndex { f, i ->
+            |            println "\\${i}: \\${f.name}"
+            |        }
+            |        def scriptNo = System.console().readLine('\\\\n> Choose a number: ')
+            |        if (scriptNo.isNumber()) {
+            |            cli scriptFiles[scriptNo.toInteger()]
+            |        }
+            |    } else {
+            |        println 'No scripts.'
+            |    }
+            |}
+            |
+            |scriptFiles.each { file ->
+            |    def taskName = file.name - '.groovy'
+            |    task "run-\\$taskName" << {
+            |        cli file
+            |    }
+            |}
+            |'''.stripMargin()
+
+        def propertiesTemplate = '''\
+            |jenkinsVersion=${jenkinsVersion}
+            |jenkinsUrl=${jenkinsUrl}
+            |'''.stripMargin()
+
+        def engine = new SimpleTemplateEngine()
+        file('build.gradle').text = engine.createTemplate(buildTemplate).make(model)
+        file('gradle.properties').text = engine.createTemplate(propertiesTemplate).make(model)
+
+        file('src/script').mkdirs()
+        if (model.pluginDependencies['groovy-postbuild']) {
+            file('src/postbuild').mkdirs()
+            file('src/postbuild/postbuild.gdsl').text = '''\
+                |contributor(context(pathRegexp:/.*\\/postbuild\\/.*/)) {
+                |    property name:'manager', type:'org.jvnet.hudson.plugins.groovypostbuild.GroovyPostbuildRecorder.BadgeManager'
+                |}
+                |'''.stripMargin()
+        }
+    }
+}
