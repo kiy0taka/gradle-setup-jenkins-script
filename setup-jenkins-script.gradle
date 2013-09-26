@@ -29,7 +29,7 @@ allprojects {
             json.plugins.inject([:]) { map, val ->
                 def plugin = updateCenter.plugins[val.shortName]
                 if (plugin) {
-                    map[val.shortName] = "${plugin.gav}@jar"
+                    map[val.shortName] = "${plugin.gav.split(':').take(2).join(':')}:${val.version}@jar"
                 }
                 map
             }
